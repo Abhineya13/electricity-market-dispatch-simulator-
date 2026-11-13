@@ -85,7 +85,7 @@ Total wind and solar generation is an **output** of dispatch, not the sum of cap
 
 ## 4. Code structure
 
-- `read_workbook()` — reads the seven data sheets from the supplied XLSX (standard-library-only XLSX reader).
+- `read_workbook()` — reads the seven Excel worksheets using `openpyxl`.
 - `validate_inputs()` — checks sheet names, hours, capacities, efficiencies and load factors.
 - `gas_bid()` — converts pence/therm to £/MWh electrical.
 - `auction()` — clears a single hour, including shortages and tied bids.
