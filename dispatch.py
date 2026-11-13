@@ -10,17 +10,15 @@ import argparse
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-from xml.etree import ElementTree as ET
-from zipfile import ZipFile
 
 import numpy as np
+from openpyxl import load_workbook
 from scipy.optimize import linprog
 
 THERMS_PER_MWH = 34.121
 PENCE_PER_POUND = 100.0
 EPS = 1e-8
-SCARCITY_SIGNAL_GBP_MWH = 500.0  # scheduling proxy only; not a clearing price
+SCARCITY_SIGNAL_GBP_MWH = 500.0  # Used for battery planning, not market pricing
 
 
 @dataclass(frozen=True)
@@ -29,7 +27,7 @@ class Battery:
     energy_mwh: float = 8000.0
     round_trip_efficiency: float = 0.90
     initial_soc_fraction: float = 0.50
-    throughput_cost_gbp_mwh: float = 2.0  # illustrative cycling penalty per MWh in or out
+    throughput_cost_gbp_mwh: float = 2.0
 
     @property
     def charge_efficiency(self) -> float:
@@ -50,64 +48,18 @@ class Battery:
             raise ValueError("Throughput cost must not be negative")
 
 
-def _cell_column(reference: str) -> int:
-    letters = ''.join(c for c in reference if c.isalpha())
-    n = 0
-    for letter in letters:
-        n = 26 * n + ord(letter.upper()) - ord('A') + 1
-    return n - 1
-
-
-def read_workbook(path: Path) -> dict[str, list[dict[str, Any]]]:
-    """Read simple tabular XLSX worksheets with Python's standard library.
-
-    Handles numbers, shared strings and inline strings. Excel calculations should be
-    saved as values in the source workbook; this assessment uses numeric inputs.
-    """
-    ns = {'m': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
-          'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-          'p': 'http://schemas.openxmlformats.org/package/2006/relationships'}
-    with ZipFile(path) as archive:
-        shared = []
-        if 'xl/sharedStrings.xml' in archive.namelist():
-            root = ET.fromstring(archive.read('xl/sharedStrings.xml'))
-            shared = [''.join(t.text or '' for t in item.findall('.//m:t', ns))
-                      for item in root.findall('m:si', ns)]
-        wb = ET.fromstring(archive.read('xl/workbook.xml'))
-        rels = ET.fromstring(archive.read('xl/_rels/workbook.xml.rels'))
-        targets = {r.attrib['Id']: r.attrib['Target'] for r in rels}
-        result = {}
-        for sheet in wb.findall('m:sheets/m:sheet', ns):
-            name = sheet.attrib['name']
-            target = targets[sheet.attrib[f'{{{ns["r"]}}}id']]
-            sheet_path = target.lstrip('/') if target.startswith('/') else 'xl/' + target
-            root = ET.fromstring(archive.read(sheet_path))
-            matrix = []
-            for row in root.findall('m:sheetData/m:row', ns):
-                cells = {}
-                for cell in row.findall('m:c', ns):
-                    col = _cell_column(cell.attrib['r'])
-                    raw = cell.find('m:v', ns)
-                    typ = cell.attrib.get('t')
-                    if typ == 'inlineStr':
-                        value = ''.join(t.text or '' for t in cell.findall('.//m:t', ns))
-                    elif raw is None or raw.text is None:
-                        value = None
-                    elif typ == 's':
-                        value = shared[int(raw.text)]
-                    elif typ in ('str', 'e'):
-                        value = raw.text
-                    else:
-                        number = float(raw.text)
-                        value = int(number) if number.is_integer() else number
-                    cells[col] = value
-                if cells:
-                    matrix.append([cells.get(i) for i in range(max(cells) + 1)])
-            if not matrix:
-                raise ValueError(f'Sheet {name} is empty')
-            headers = [str(h) for h in matrix[0]]
-            result[name] = [dict(zip(headers, values)) for values in matrix[1:]]
-    return result
+def read_workbook(path: Path) -> dict[str, list[dict]]:
+    """Load the seven input tables from Excel."""
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        tables = {}
+        for sheet in workbook.worksheets:
+            rows = iter(sheet.values)
+            headers = next(rows)
+            tables[sheet.title] = [dict(zip(headers, row)) for row in rows]
+        return tables
+    finally:
+        workbook.close()
 
 
 def validate_inputs(tables: dict[str, list[dict]]) -> list[int]:
@@ -148,12 +100,7 @@ def gas_bid(gas_pence_per_therm: float, efficiency: float) -> float:
 
 
 def auction(tables: dict, idx: int, demand_mwh: float) -> dict:
-    """Dispatch cheapest generators first; the last used bid sets market price.
-
-    Each hour lasts one hour, so MW capacity produces the same number of MWh.
-    Equal-priced offers are allocated pro rata by available capacity;
-    all wind and solar have the same zero price.
-    """
+    """Dispatch cheapest offers first and return the hourly generation mix."""
     if demand_mwh < -EPS:
         raise ValueError('Demand cannot be negative')
     bids = []
@@ -193,7 +140,7 @@ def auction(tables: dict, idx: int, demand_mwh: float) -> dict:
     if remaining <= EPS:
         remaining = 0.0
     else:
-        marginal_price = None  # no accepted bid can clear this demand
+        marginal_price = None  # Supply is insufficient to clear the hour
     renewable_available = sum(v for _, _, tech, v in bids if tech != 'gas')
     return {'price_gbp_mwh': marginal_price, 'wind_mwh': mix['wind'],
             'solar_mwh': mix['solar'], 'gas_mwh': mix['gas'],
@@ -203,18 +150,11 @@ def auction(tables: dict, idx: int, demand_mwh: float) -> dict:
 
 
 def schedule_battery(baseline_prices: np.ndarray, battery: Battery) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Perfect-foresight illustrative arbitrage against baseline (not realised) prices.
-
-    Linear program selects grid-side MWh charged/discharged each hour, with an
-    energy balance, hourly power limits, and terminal SoC = initial SoC.
-    There are NO simultaneous charge/discharge constraints, but strict efficiency
-    losses and positive throughput cost make simultaneous cycling suboptimal.
-    """
+    """Plan battery charging and discharge using baseline prices."""
     battery.validate()
     n = len(baseline_prices)
     if not np.isfinite(baseline_prices).all():
         raise ValueError('Battery scheduling prices must be finite')
-    # Variables: [charge[0:n], discharge[0:n], soc[0:n]]
     c = np.concatenate([baseline_prices + battery.throughput_cost_gbp_mwh,
                         -baseline_prices + battery.throughput_cost_gbp_mwh,
                         np.zeros(n)])
@@ -245,7 +185,7 @@ def schedule_battery(baseline_prices: np.ndarray, battery: Battery) -> tuple[np.
     return charge, discharge, soc
 
 
-def simulate(tables: dict, battery: Battery) -> tuple[list[dict], list[dict], list[dict]]:
+def simulate(tables: dict, battery: Battery) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     hours = validate_inputs(tables)
     baseline = []
     baseline_detail = []
@@ -255,16 +195,14 @@ def simulate(tables: dict, battery: Battery) -> tuple[list[dict], list[dict], li
         baseline.append({'hour': hour, 'demand_mwh': demand, **{k: v for k, v in result.items() if k != 'plant_dispatch'}})
         baseline_detail.append({'hour': hour, 'scenario': 'baseline', **result['plant_dispatch']})
     prices = np.array([np.nan if r['price_gbp_mwh'] is None else r['price_gbp_mwh'] for r in baseline])
-    # If demand exceeds available generation, no marginal bid clears the market.
-    # For battery scheduling ONLY, use an explicit scarcity-value proxy.
+    # A scarcity proxy schedules the battery when no clearing price exists.
     planning_prices = np.where(np.isfinite(prices), prices, SCARCITY_SIGNAL_GBP_MWH)
     charge, discharge, soc = schedule_battery(planning_prices, battery)
     with_storage = []
     dispatch_detail = []
     for idx, hour in enumerate(hours):
         demand = float(tables['demand'][idx]['demand'])
-        # Battery is committed, price-taking net injection / withdrawal. All remaining
-        # generation is re-dispatched at its submitted bid against residual load.
+
         effective_demand = demand + float(charge[idx]) - float(discharge[idx])
         if effective_demand < -EPS:
             raise RuntimeError('Battery discharge exceeds demand plus charge')
