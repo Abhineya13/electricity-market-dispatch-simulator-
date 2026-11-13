@@ -1,0 +1,9 @@
+Hours: 168
+Demand: 4,050,186.5 MWh
+Price without / with storage: £62.09 / £64.48 per MWh (simple hourly mean)
+Gas generation without / with storage: 1,783,137.3 / 1,797,087.4 MWh
+Wind generation without / with storage: 1,421,258.7 / 1,425,643.1 MWh
+Solar generation without / with storage: 785,464.2 / 790,119.6 MWh
+Battery charging / discharging: 61,058.4 / 54,952.6 MWh
+Unserved electricity without / with storage: 60,326.3 / 43,442.3 MWh
+Hours without clearing price (insufficient supply), baseline / storage: 29 / 22
